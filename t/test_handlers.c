@@ -32,7 +32,8 @@ static int test_handle_event(struct projfs_event *event, const char *desc,
 {
 	unsigned int opt_flags, ret_flags;
 	const char *retfile, *lockfile = NULL;
-	int ret, timeout = 0, fd = 0, res;
+	int timeout = 0, fd = 0;
+	int ret;
 
 	opt_flags = test_get_opts((TEST_OPT_RETVAL | TEST_OPT_RETFILE |
 				   TEST_OPT_TIMEOUT | TEST_OPT_LOCKFILE),
@@ -54,7 +55,7 @@ static int test_handle_event(struct projfs_event *event, const char *desc,
 	if (proj) {
 		if ((event->mask & ~PROJFS_ONDIR) != PROJFS_CREATE_SELF) {
 			fprintf(stderr, "unknown projection flags\n");
-			ret = -EINVAL;
+			return -EINVAL;
 		}
 
 		// TODO: hydrate file/dir based on projection list
@@ -62,10 +63,8 @@ static int test_handle_event(struct projfs_event *event, const char *desc,
 
 	if (lockfile) {
 		fd = open(lockfile, (O_CREAT | O_EXCL | O_RDWR), 0600);
-		if (fd == -1 && errno == EEXIST)
-			return -EEXIST;
-		else if (fd == -1)
-			return -EINVAL;
+		if (fd == -1)
+			return -errno;
 	}
 
 	if (timeout)
@@ -73,9 +72,8 @@ static int test_handle_event(struct projfs_event *event, const char *desc,
 
 	if (lockfile) {
 		close(fd);
-		res = unlink(lockfile);
-		if (res == -1)
-			return -EINVAL;
+		if (unlink(lockfile) == -1)
+			return -errno;
 	}
 
 	if ((ret_flags & TEST_VAL_SET) == TEST_VAL_UNSET)
