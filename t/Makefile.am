@@ -26,12 +26,16 @@ test_common = test_common.c \
 	      $(top_srcdir)/include/projfs.h \
 	      $(top_srcdir)/include/projfs_notify.h
 
-check_PROGRAMS = get_strerror \
+check_PROGRAMS = echo_attrlist \
+		 get_strerror \
+		 test_attrs \
 		 test_handlers \
 		 test_simple \
 		 wait_mount
 
+echo_attrlist_SOURCES = echo_attrlist.c $(test_common)
 get_strerror_SOURCES = get_strerror.c $(test_common)
+test_attrs_SOURCES = test_attrs.c $(test_common)
 test_handlers_SOURCES = test_handlers.c $(test_common)
 test_simple_SOURCES = test_simple.c $(test_common)
 wait_mount_SOURCES = wait_mount.c $(test_common)

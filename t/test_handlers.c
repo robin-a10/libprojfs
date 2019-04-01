@@ -55,7 +55,8 @@ static int test_handle_event(struct projfs_event *event, const char *desc,
 	if (proj) {
 		if ((event->mask & ~PROJFS_ONDIR) != PROJFS_CREATE_SELF) {
 			fprintf(stderr, "unknown projection flags\n");
-			return -EINVAL;
+			ret = -EINVAL;
+			goto out_opts;
 		}
 
 		// TODO: hydrate file/dir based on projection list
@@ -63,8 +64,10 @@ static int test_handle_event(struct projfs_event *event, const char *desc,
 
 	if (lockfile) {
 		fd = open(lockfile, (O_CREAT | O_EXCL | O_RDWR), 0600);
-		if (fd == -1)
-			return -errno;
+		if (fd == -1) {
+			ret = -errno;
+			goto out_opts;
+		}
 	}
 
 	if (timeout)
@@ -72,14 +75,19 @@ static int test_handle_event(struct projfs_event *event, const char *desc,
 
 	if (lockfile) {
 		close(fd);
-		if (unlink(lockfile) == -1)
-			return -errno;
+		if (unlink(lockfile) == -1) {
+			ret = -errno;
+			goto out_opts;
+		}
 	}
 
 	if ((ret_flags & TEST_VAL_SET) == TEST_VAL_UNSET)
 		ret = perm ? PROJFS_ALLOW : 0;
 	else if (!perm && ret > 0)
 		ret = 0;
+
+out_opts:
+	test_free_opts(opt_flags);
 
 	return ret;
 }
