@@ -70,12 +70,11 @@ static struct projfs *projfs_context_fs(void)
 	return (struct projfs *)fuse_get_context()->private_data;
 }
 
-//// TODO: merge into others below
 /**
  * @return 0 or a negative errno
  */
 static int projfs_fuse_send_event(projfs_handler_t handler,
-                                  uint64_t mask,
+                                  uint64_t mask, pid_t pid,
                                   const char *path,
                                   const char *target_path,
                                   int fd,
@@ -87,9 +86,12 @@ static int projfs_fuse_send_event(projfs_handler_t handler,
 	if (handler == NULL)
 		return 0;
 
+	if (pid == 0)
+		pid = fuse_get_context()->pid;
+
 	event.fs = projfs_context_fs();
 	event.mask = mask;
-	event.pid = fuse_get_context()->pid;
+	event.pid = pid;
 	event.path = path;
 	event.target_path = target_path ? (target_path + 1) : NULL;
 	event.fd = fd;
@@ -99,8 +101,7 @@ static int projfs_fuse_send_event(projfs_handler_t handler,
 		fprintf(stderr, "projfs: event handler failed: %s; "
 		                "event mask 0x%04" PRIx64 "-%08" PRIx64 ", "
 		                "pid %d\n",
-		        strerror(-err), mask >> 32, mask & 0xFFFFFFFF,
-		        event.pid);
+		        strerror(-err), mask >> 32, mask & 0xFFFFFFFF, pid);
 	}
 	else if (!fd && perm)
 		err = (err == PROJFS_ALLOW) ? 0 : -EPERM;
@@ -119,13 +120,13 @@ static int projfs_fuse_proj_event(uint64_t mask,
 		projfs_context_fs()->handlers.handle_proj_event;
 
 	return projfs_fuse_send_event(
-		handler, mask, path, NULL, fd, 0);
+		handler, mask, 0, path, NULL, fd, 0);
 }
 
 /**
  * @return 0 or a negative errno
  */
-static int projfs_fuse_notify_event(uint64_t mask,
+static int projfs_fuse_notify_event(uint64_t mask, pid_t pid,
                                     const char *path,
                                     const char *target_path)
 {
@@ -133,7 +134,7 @@ static int projfs_fuse_notify_event(uint64_t mask,
 		projfs_context_fs()->handlers.handle_notify_event;
 
 	return projfs_fuse_send_event(
-		handler, mask, path + 1, target_path, 0, 0);
+		handler, mask, pid, path + 1, target_path, 0, 0);
 }
 
 /**
@@ -147,7 +148,7 @@ static int projfs_fuse_perm_event(uint64_t mask,
 		projfs_context_fs()->handlers.handle_perm_event;
 
 	return projfs_fuse_send_event(
-		handler, mask, path + 1, target_path, 0, 1);
+		handler, mask, 0, path + 1, target_path, 0, 1);
 }
 
 #define PROJ_XATTR_PRE_NAME "user.projection."
@@ -222,9 +223,10 @@ static int remove_xattr_projflag(int fd)
 struct node_userdata
 {
 	int fd;
-
 	uint8_t proj_flag;
 };
+
+static const char *dotpath = ".";
 
 /**
  * Return a copy of path with the last component removed (e.g. "x/y/z" will
@@ -239,7 +241,7 @@ static char *get_path_parent(char const *path)
 {
 	const char *last = strrchr(path, '/');
 	if (!last)
-		return strdup(".");
+		return strdup(dotpath);
 	else
 		return strndup(path, last - path);
 }
@@ -428,7 +430,62 @@ out:
 	return res;
 }
 
-static const char *dotpath = ".";
+struct file_pid_entry {
+	int fd;
+	pid_t pid;
+	struct file_pid_entry *prev;
+	struct file_pid_entry *next;
+};
+
+static pthread_mutex_t file_pid_lock;
+static struct file_pid_entry *first_file_pid_entry;
+
+//// DEBUG chrisd: use hash instead; store in fs->pid_map; overwrite same fd?
+static int add_file_pid_entry(int fd, pid_t pid)
+{
+	struct file_pid_entry *entry;
+
+	entry = calloc(1, sizeof(*entry));
+	if (entry == NULL)
+		return errno;
+
+	entry->fd = fd;
+	entry->pid = pid;
+
+	pthread_mutex_lock(&file_pid_lock);
+	entry->next = first_file_pid_entry;
+	first_file_pid_entry = entry;
+	pthread_mutex_unlock(&file_pid_lock);
+	return 0;
+}
+
+static pid_t remove_file_pid_entry(int fd)
+{
+	struct file_pid_entry *entry = first_file_pid_entry;
+	pid_t pid = 0;
+
+	pthread_mutex_lock(&file_pid_lock);
+	if (entry == NULL)
+		goto out_unlock;
+
+	while (entry->fd != fd)
+		entry = entry->next;
+	if (entry == NULL)
+		goto out_unlock;
+
+	pid = entry->pid;
+	if (entry->next != NULL)
+		entry->next->prev = entry->prev;
+	if (entry->prev == NULL)
+		first_file_pid_entry = entry->next;
+	else
+		entry->prev->next = entry->next;
+	free(entry);
+
+out_unlock:
+	pthread_mutex_unlock(&file_pid_lock);
+	return pid;
+}
 
 /**
  * Makes a path from FUSE usable as a relative path to lowerdir_fd.  Removes
@@ -559,6 +616,8 @@ static int projfs_op_symlink(char const *link, char const *path)
 	return res == -1 ? -errno : 0;
 }
 
+#define has_write_flag(fi) ((fi->flags) | (O_WRONLY | O_RDWR))
+
 static int projfs_op_create(char const *path, mode_t mode,
                             struct fuse_file_info *fi)
 {
@@ -570,6 +629,7 @@ static int projfs_op_create(char const *path, mode_t mode,
 	 * to hydrate it if it exists. */
 
 	int flags = fi->flags & ~O_NOFOLLOW;
+	pid_t pid;
 	int res;
 	int fd;
 
@@ -585,8 +645,13 @@ static int projfs_op_create(char const *path, mode_t mode,
 		return -errno;
 	fi->fh = fd;
 
+	pid = fuse_get_context()->pid;
+	// don't try to close fd in case of memory alloc error; just ignore
+	if (has_write_flag(fi))
+		add_file_pid_entry(fd, pid);
+
 	res = projfs_fuse_notify_event(
-		PROJFS_CREATE_SELF,
+		PROJFS_CREATE_SELF, pid,
 		path,
 		NULL);
 	return res;
@@ -615,6 +680,10 @@ static int projfs_op_open(char const *path, struct fuse_file_info *fi)
 	fd = openat(lowerdir_fd(), lowerpath(path), flags);
 	if (fd == -1)
 		return -errno;
+
+	// don't try to close fd in case of memory alloc error; just ignore
+	if (has_write_flag(fi))
+		add_file_pid_entry(fd, fuse_get_context()->pid);
 
 	fi->fh = fd;
 	return 0;
@@ -667,11 +736,22 @@ static int projfs_op_write_buf(char const *path, struct fuse_bufvec *src,
 
 static int projfs_op_release(char const *path, struct fuse_file_info *fi)
 {
-	int res = close(fi->fh);
+	int res;
+	pid_t pid = 0;
 
-	(void)path;
+	if (has_write_flag(fi))
+		pid = remove_file_pid_entry(fi->fh);
+
+	res = close(fi->fh);
 	// return value is ignored by libfuse, but be consistent anyway
-	return res == -1 ? -errno : 0;
+	if (res == -1)
+		return -errno;
+
+	if (has_write_flag(fi)) {
+                res = projfs_fuse_notify_event(PROJFS_CLOSE_WRITE, pid,
+					       path, NULL);
+	}
+	return res;
 }
 
 static int projfs_op_unlink(char const *path)
@@ -700,7 +780,7 @@ static int projfs_op_mkdir(char const *path, mode_t mode)
 		return -errno;
 
 	res = projfs_fuse_notify_event(
-		PROJFS_CREATE_SELF | PROJFS_ONDIR,
+		PROJFS_CREATE_SELF | PROJFS_ONDIR, 0,
 		path,
 		NULL);
 	return res;
@@ -750,7 +830,7 @@ static int projfs_op_rename(char const *src, char const *dst,
 	if (res == -1)
 		return -errno;
 
-	res = projfs_fuse_notify_event(mask, src, dst);
+	res = projfs_fuse_notify_event(mask, 0, src, dst);
 	return res;
 }
 
@@ -1231,7 +1311,7 @@ static int check_dir_empty(const char *path)
 			return -1;
 		}
 
-		if (strcmp(e->d_name, ".") == 0 ||
+		if (strcmp(e->d_name, dotpath) == 0 ||
 				strcmp(e->d_name, "..") == 0)
 			; /* ignore */
 		else
@@ -1430,6 +1510,9 @@ int projfs_start(struct projfs *fs)
 	sigaddset(&newset, SIGQUIT);
 	// TODO: handle error from pthread_sigmask()
 	pthread_sigmask(SIG_BLOCK, &newset, &oldset);
+
+//// DEBUG chrisd: move to fs->pid_map_lock, pid_map
+	pthread_mutex_init(&file_pid_lock, NULL);
 
 	res = pthread_create(&thread_id, NULL, projfs_loop, fs);
 
