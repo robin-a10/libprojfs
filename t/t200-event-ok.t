@@ -42,12 +42,14 @@ test_expect_success 'test event handler on nested directory creation' '
 # TODO: also use 'echo ... >' to exercise open() not create()
 
 projfs_event_printf notify create_file f1.txt
+projfs_event_printf notify modify_file f1.txt
 test_expect_success 'test event handler on top-level file creation' '
 	projfs_event_exec touch target/f1.txt &&
 	test_path_is_file target/f1.txt
 '
 
 projfs_event_printf notify create_file d1/d2/f2.txt
+projfs_event_printf notify modify_file d1/d2/f2.txt
 test_expect_success 'test event handler on nested file creation' '
 	projfs_event_exec touch target/d1/d2/f2.txt &&
 	test_path_is_file target/d1/d2/f2.txt
@@ -93,6 +95,8 @@ test_expect_success 'test permission granted on parent directory deletion' '
 
 rm retval
 projfs_stop || exit 1
+#### DEBUG chrisd: need to handle multiple messages in event_printf/exec
+test_pause
 
 test_expect_success 'check all event notifications' '
 	test_cmp test_handlers.log "$EVENT_LOG"
